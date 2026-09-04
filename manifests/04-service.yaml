@@ -1,0 +1,19 @@
+# Client-facing service. Only the pod that has acquired the KahaDB lock and
+# is actually listening on 61616/8161 will pass its readinessProbe, so this
+# Service's Endpoints always point at whichever pod is currently master.
+apiVersion: v1
+kind: Service
+metadata:
+  name: amq-broker
+  namespace: amq-test
+spec:
+  type: ClusterIP
+  selector:
+    app: amq
+  ports:
+    - name: openwire
+      port: 61616
+      targetPort: 61616
+    - name: web
+      port: 8161
+      targetPort: 8161

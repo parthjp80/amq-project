@@ -1,0 +1,17 @@
+# Required by StatefulSet; also gives stable per-pod DNS (amq-0, amq-1) so
+# you can port-forward/inspect either instance directly regardless of which
+# one is currently master.
+apiVersion: v1
+kind: Service
+metadata:
+  name: amq-headless
+  namespace: amq-test
+spec:
+  clusterIP: None
+  selector:
+    app: amq
+  ports:
+    - name: openwire
+      port: 61616
+    - name: web
+      port: 8161

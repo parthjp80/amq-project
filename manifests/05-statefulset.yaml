@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: amq
+  namespace: amq-test
+spec:
+  serviceName: amq-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: amq
+  template:
+    metadata:
+      labels:
+        app: amq
+    spec:
+      # Spread master/slave across different nodes so killing one node
+      # actually exercises failover, not just a container restart.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: amq
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: activemq
+          image: apache/activemq-classic:5.19.2
+          ports:
+            - name: openwire
+              containerPort: 61616
+            - name: web
+              containerPort: 8161
+          volumeMounts:
+            - name: config
+              mountPath: /opt/apache-activemq/conf/activemq.xml
+              subPath: activemq.xml
+            - name: kahadb-shared
+              mountPath: /opt/apache-activemq/data/kahadb
+          readinessProbe:
+            # Only the pod that has won the KahaDB lock and finished
+            # starting the broker actually listens on 61616. The standby
+            # pod fails this probe (by design) and is removed from the
+            # amq-broker Service's Endpoints until it takes over.
+            tcpSocket:
+              port: 61616
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+          # Deliberately no livenessProbe on the broker port: the standby
+          # pod is *supposed* to not be listening while waiting for the
+          # lock, and a liveness probe on 61616 would cause Kubernetes to
+          # kill and restart the healthy standby in a crash loop.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: amq-config
+        - name: kahadb-shared
+          persistentVolumeClaim:
+            claimName: amq-kahadb-shared

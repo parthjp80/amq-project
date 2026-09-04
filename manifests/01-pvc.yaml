@@ -1,0 +1,16 @@
+# Single shared KahaDB store. Both the master and slave broker pods mount
+# this SAME volume at the SAME path. ActiveMQ's KahaDB persistence adapter
+# uses a file lock inside this directory to arbitrate which instance is
+# master; the loser blocks in slave mode until the lock is released.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: amq-kahadb-shared
+  namespace: amq-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-csi
+  resources:
+    requests:
+      storage: 2Gi

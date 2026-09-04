@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amq-config
+  namespace: amq-test
+data:
+  activemq.xml: |
+    <!--
+      Shared-filesystem master/slave config. Both pods run this exact same
+      config and point at the same KahaDB directory (mounted from the RWX
+      NFS PVC). The <shared-file-locker/> makes the lock-acquisition explicit
+      and polling-based, which is the documented-safe way to do master/slave
+      over a networked filesystem like NFS (plain OS file locks over NFS are
+      not reliable enough on their own).
+    -->
+    <beans
+      xmlns="http://www.springframework.org/schema/beans"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+      http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+      <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+        <property name="locations">
+          <value>file:${activemq.conf}/credentials.properties</value>
+        </property>
+      </bean>
+
+      <broker xmlns="http://activemq.apache.org/schema/core"
+              brokerName="amq-broker"
+              dataDirectory="${activemq.data}">
+
+        <persistenceAdapter>
+          <kahaDB directory="${activemq.data}/kahadb" lockKeepAlivePeriod="2000">
+            <locker>
+              <shared-file-locker lockAcquireSleepInterval="2000"/>
+            </locker>
+          </kahaDB>
+        </persistenceAdapter>
+
+        <managementContext>
+          <managementContext createConnector="false"/>
+        </managementContext>
+
+        <systemUsage>
+          <systemUsage>
+            <memoryUsage>
+              <memoryUsage percentOfJvmHeap="70"/>
+            </memoryUsage>
+            <storeUsage>
+              <storeUsage limit="1 gb"/>
+            </storeUsage>
+            <tempUsage>
+              <tempUsage limit="100 mb"/>
+            </tempUsage>
+          </systemUsage>
+        </systemUsage>
+
+        <transportConnectors>
+          <transportConnector name="openwire" uri="tcp://0.0.0.0:61616?maximumConnections=1000&amp;wireFormat.maxFrameSize=104857600"/>
+        </transportConnectors>
+
+        <shutdownHooks>
+          <bean xmlns="http://www.springframework.org/schema/beans" class="org.apache.activemq.hooks.SpringContextHook"/>
+        </shutdownHooks>
+
+      </broker>
+
+      <import resource="jetty.xml"/>
+
+    </beans>
