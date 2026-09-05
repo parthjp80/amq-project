@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: amq-broker
+  namespace: amq-lease-ha
+---
+# Scoped to get/patch on exactly one named Lease object - the broker pods
+# use this to run their own leader election, they don't need any other
+# cluster access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: amq-lease-holder
+  namespace: amq-lease-ha
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["amq-active"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: amq-lease-holder
+  namespace: amq-lease-ha
+subjects:
+  - kind: ServiceAccount
+    name: amq-broker
+    namespace: amq-lease-ha
+roleRef:
+  kind: Role
+  name: amq-lease-holder
+  apiGroup: rbac.authorization.k8s.io

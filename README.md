@@ -1,118 +1,128 @@
-# ActiveMQ Classic — Active/Passive HA Test
+# ActiveMQ Active/Passive HA — Homelab Test
 
-Apache ActiveMQ 5.19.2 ("classic"), shared-filesystem master/slave, deployed
-as plain Kubernetes manifests (no operator, no Helm) against the homelab
-cluster for HA testing. Standalone `kubectl apply` for now — not wired into
-Flux yet.
+Two different ways to run Apache ActiveMQ 5.19.2 ("classic") active/passive
+on the homelab Kubernetes cluster, tested live under load and failure. Pick
+based on whether you need message durability:
 
-## How the HA works
+| | Needs durability? | Doc |
+|---|---|---|
+| **KahaDB / shared storage** | Yes | [README-kahadb-ha.md](README-kahadb-ha.md) |
+| **Kubernetes Lease election** | No | [manifests-lease-ha/README.md](manifests-lease-ha/README.md) |
 
-Two pods (`amq-0`, `amq-1`) run the *exact same* broker config and both
-mount the *same* KahaDB data directory from a single RWX PVC (`nfs-csi`
-StorageClass, backed by the NAS at 192.168.1.219). ActiveMQ's KahaDB
-persistence adapter uses a file lock inside that shared directory to decide
-who's master:
+## Architecture 1: KahaDB shared-storage master/slave
 
-- Whichever pod acquires the lock starts fully (binds `61616` openwire,
-  `8161` web console) and becomes **master**.
-- The other pod blocks at startup ("`... in slave mode waiting a lock to be
-  acquired`") and does **not** bind any ports — it's a hot standby.
-- If the master dies, its lock is released; the standby acquires it within
-  a few seconds (`lockAcquireSleepInterval=2000` in the config) and starts
-  serving.
+Election is implemented *as* a lock inside the persistence store itself —
+there's no separate arbitration mechanism. Requires RWX shared storage
+(NFS in this cluster), which also becomes a new single point of failure.
 
-Kubernetes routes to whichever pod is currently master via a
-`readinessProbe` (TCP check on 61616): only the master passes it, so the
-`amq-broker` Service's Endpoints always point at the live master. There is
-**no livenessProbe on the broker port** — the standby not listening is
-correct/expected behavior, and a liveness probe there would kill the
-healthy standby in a loop.
+```mermaid
+flowchart LR
+    subgraph clients [" "]
+        P["Producer / Consumer"]
+    end
 
-## Files
+    P -->|"tcp://61616<br/>failover-aware"| SVC
 
-| File | Purpose |
-|---|---|
-| `manifests/00-namespace.yaml` | `amq-test` namespace |
-| `manifests/01-pvc.yaml` | Shared RWX PVC for KahaDB (`nfs-csi`) |
-| `manifests/02-configmap.yaml` | `activemq.xml` — shared-file-locker config |
-| `manifests/03-headless-service.yaml` | Required by the StatefulSet; per-pod DNS for debugging |
-| `manifests/04-service.yaml` | Client-facing Service; Endpoints always = current master |
-| `manifests/05-statefulset.yaml` | 2 replicas, anti-affinity (preferred), readiness-gated |
+    subgraph k8s ["Kubernetes: amq-test namespace"]
+        SVC["Service: amq-broker<br/>(readinessProbe-gated)"]
 
-## Deploy
+        subgraph pod0 ["Pod: amq-0"]
+            AMQ0["activemq<br/>MASTER<br/>listening 61616/8161"]
+        end
+        subgraph pod1 ["Pod: amq-1"]
+            AMQ1["activemq<br/>SLAVE<br/>blocked, not listening"]
+        end
 
-```
-kubectl apply -f manifests/
-kubectl -n amq-test get pods -o wide
-```
+        SVC -->|"routed (Ready)"| AMQ0
+        SVC -.->|"excluded (Not Ready)"| AMQ1
+    end
 
-Check who's master:
-```
-kubectl -n amq-test logs amq-0 | grep -E "started|slave mode"
-kubectl -n amq-test get endpoints amq-broker   # IP shown = current master
-```
+    AMQ0 <-->|"read/write +<br/>file lock"| PVC
+    AMQ1 <-.->|"polls for lock<br/>(lockAcquireSleepInterval)"| PVC
 
-## Testing failover
+    subgraph storage ["Shared storage"]
+        PVC[("PVC: amq-kahadb-shared<br/>RWX, nfs-csi")]
+        NFS[("NAS<br/>192.168.1.219")]
+        PVC --- NFS
+    end
 
-```
-# note current master
-kubectl -n amq-test get endpoints amq-broker
-
-# kill it
-kubectl -n amq-test delete pod <master-pod> --grace-period=0 --force
-
-# watch the standby take over (usually ~5-10s)
-watch kubectl -n amq-test get endpoints amq-broker
+    style AMQ0 fill:#2d6a4f,color:#fff
+    style AMQ1 fill:#6c757d,color:#fff
+    style NFS fill:#7f1d1d,color:#fff
 ```
 
-### Verified 2026-09-04
+**Failure mode tested:** kill `amq-0` → `amq-1`'s KahaDB lock-poll acquires
+the now-released lock (~6-9s) → it starts fully → Service Endpoints flip to
+it. Persistent messages produced right before the kill survive (recovered
+from the shared store); non-persistent ones don't.
 
-- Killed the master repeatedly; standby was promoted and passed readiness
-  within ~6-9 seconds each time. Service endpoints updated automatically.
-- Durability check: produced 1000 persistent messages to `queue://TEST.HA`
-  via the master, killed that pod, then consumed all 1000 back out from the
-  newly-promoted master. Zero message loss.
-- CLI test tools live inside the image, e.g.:
-  ```
-  kubectl -n amq-test exec <pod> -- /opt/apache-activemq/bin/activemq producer \
-    --destination queue://TEST.HA --persistent true --user admin --password admin
-  kubectl -n amq-test exec <pod> -- /opt/apache-activemq/bin/activemq consumer \
-    --destination queue://TEST.HA --user admin --password admin
-  ```
+## Architecture 2: Kubernetes Lease leader election
 
-## Known caveats / things to watch
+No shared storage, no persistence adapter at all (`persistent="false"`).
+Each broker pod is fully independent; a sidecar in the same pod does
+leader election against a `Lease` object (an etcd-backed lock — the same
+primitive Kubernetes controllers use internally).
 
-- **Both pods currently land on the same node (`k8s-worker-2`).** The
-  StatefulSet has `preferredDuringSchedulingIgnoredDuringExecution`
-  pod anti-affinity (soft), not `required` (hard) — soft was chosen
-  deliberately so pods don't go `Pending` if a node lacks room. Right now
-  `k8s-worker-1` is already at ~89% of its allocatable memory *requests*
-  from other homelab workloads, so the scheduler packs both AMQ pods onto
-  worker-2. This means today's failover test only proves *process-level*
-  failover, not *node-level* failure. To force a true node-loss test, free
-  up memory on worker-1 or temporarily cordon worker-2.
-- **NFS locking caveat**: shared-filesystem master/slave depends on the
-  underlying filesystem's locking being trustworthy. Plain NFS advisory
-  locks have a history of being flaky, which is why the config explicitly
-  uses `<shared-file-locker/>` (polling-based, not relying on raw fcntl
-  semantics) rather than the default locker. This has worked cleanly in
-  testing so far, but keep an eye out for split-brain if the NFS server
-  itself has issues.
-- **The NFS server (192.168.1.219) is a new single point of failure** for
-  this setup — if it goes down, both master and slave lose their store.
-  That's an accepted tradeoff for a HA *broker process* test; it's not
-  storage-layer HA.
-- Default `admin`/`admin` credentials from the stock image — fine for an
-  isolated test namespace, don't reuse if this ever gets promoted beyond
-  `amq-test`.
-- Not wired into Flux — this is `kubectl apply`-only in the `amq-test`
-  namespace, isolated from the rest of the GitOps-managed homelab stack.
+```mermaid
+flowchart LR
+    subgraph clients [" "]
+        P["Producer / Consumer"]
+    end
 
-## Teardown
+    P -->|"tcp://61616<br/>failover-aware"| SVC
 
+    subgraph k8s ["Kubernetes: amq-lease-ha namespace"]
+        SVC["Service: amq-broker<br/>(readinessProbe-gated)"]
+
+        subgraph pod0 ["Pod: amq-0"]
+            direction TB
+            AMQ0["activemq<br/>always fully running<br/>listening 61616/8161"]
+            EL0["leader-elector sidecar<br/>(kubectl + jq loop)"]
+            FILE0["/shared/leader = true"]
+            EL0 -->|writes| FILE0
+            FILE0 -->|readinessProbe reads| AMQ0
+        end
+        subgraph pod1 ["Pod: amq-1"]
+            direction TB
+            AMQ1["activemq<br/>always fully running<br/>listening 61616/8161"]
+            EL1["leader-elector sidecar<br/>(kubectl + jq loop)"]
+            FILE1["/shared/leader = false"]
+            EL1 -->|writes| FILE1
+            FILE1 -->|readinessProbe reads| AMQ1
+        end
+
+        SVC -->|"routed (Ready)"| AMQ0
+        SVC -.->|"excluded (Not Ready)"| AMQ1
+
+        LEASE["Lease: amq-active<br/>holderIdentity + renew-epoch<br/>(resourceVersion = CAS lock)"]
+        EL0 <-->|"get / patch<br/>(claims + renews)"| LEASE
+        EL1 <-->|"get / patch<br/>(polls, contends when stale)"| LEASE
+    end
+
+    style AMQ0 fill:#2d6a4f,color:#fff
+    style AMQ1 fill:#6c757d,color:#fff
+    style LEASE fill:#1d4e89,color:#fff
 ```
-kubectl delete namespace amq-test
-```
-(The PVC's `nfs-csi` StorageClass has `reclaimPolicy: Retain`, so the
-underlying NFS-backed volume will need manual cleanup on the NAS/PV if you
-want the space back.)
+
+**Failure mode tested:** kill `amq-0` → its Lease entry goes stale after
+`LEASE_TTL=15s` with no active renewal → whichever pod's poll loop hits
+next claims it via a `resourceVersion`-guarded patch (~15-24s total,
+observed both `amq-1` and a restarted `amq-0` win this race) → Service
+Endpoints flip. Nothing survives a kill — there's no store, so any
+unconsumed message is gone regardless of when it was produced.
+
+## Summary of what was verified
+
+| | KahaDB master/slave | Lease election |
+|---|---|---|
+| Shared storage required | Yes (RWX NFS) | No |
+| Failover time (observed) | ~6-9s | ~15-24s |
+| Persistent messages survive failover | Yes | N/A (no persistence) |
+| Non-persistent messages survive failover | No | No |
+| Peak throughput (non-persistent) | ~10,000 msg/sec | ~23,800 msg/sec (5 threads) |
+| Client reconnect after failover | Automatic (`failover://` URL) | Automatic (`failover://` URL) |
+
+Full details, exact commands, and caveats for each are in their respective
+READMEs linked above. Neither is wired into Flux — both are
+`kubectl apply -f <dir>/`-only, kept isolated from the rest of the
+GitOps-managed homelab stack.

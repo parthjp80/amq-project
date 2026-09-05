@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: amq
+  namespace: amq-lease-ha
+spec:
+  serviceName: amq-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: amq
+  template:
+    metadata:
+      labels:
+        app: amq
+    spec:
+      serviceAccountName: amq-broker
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: amq
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: activemq
+          image: apache/activemq-classic:5.19.2
+          env:
+            - name: ACTIVEMQ_OPTS_MEMORY
+              value: "-Xms64M -Xmx192M"
+          ports:
+            - name: openwire
+              containerPort: 61616
+            - name: web
+              containerPort: 8161
+          volumeMounts:
+            - name: config
+              mountPath: /opt/apache-activemq/conf/activemq.xml
+              subPath: activemq.xml
+            - name: shared
+              mountPath: /shared
+          readinessProbe:
+            # Ready only if the elector sidecar has written "true" - i.e.
+            # only if this pod currently holds the amq-active Lease. Both
+            # replicas always fully start and bind their ports (there's no
+            # shared-storage lock to block one of them like in the KahaDB
+            # setup) - this probe is the only thing keeping the Service
+            # pointed at exactly one of them.
+            exec:
+              command: ["sh", "-c", "test \"$(cat /shared/leader 2>/dev/null)\" = true"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 160Mi
+            limits:
+              memory: 320Mi
+        - name: leader-elector
+          image: alpine/k8s:1.30.14
+          command: ["sh", "/scripts/elector.sh"]
+          volumeMounts:
+            - name: elector-script
+              mountPath: /scripts
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: config
+          configMap:
+            name: amq-config
+        - name: elector-script
+          configMap:
+            name: amq-elector
+            defaultMode: 0755
+        - name: shared
+          emptyDir: {}

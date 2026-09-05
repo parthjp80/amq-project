@@ -1,0 +1,12 @@
+# Pre-created empty so every field the elector script touches (holderIdentity,
+# the renew-epoch annotation) already exists - JSON Patch "replace" ops need
+# the target path to exist.
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: amq-active
+  namespace: amq-lease-ha
+  annotations:
+    amq.test/renew-epoch: "0"
+spec:
+  holderIdentity: ""

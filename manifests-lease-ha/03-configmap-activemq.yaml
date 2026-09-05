@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amq-config
+  namespace: amq-lease-ha
+data:
+  activemq.xml: |
+    <!--
+      No persistence adapter at all - persistent="false" means this broker
+      never touches disk for messages (no KahaDB, no store). Every instance
+      is fully independent; there is no shared state and no shared-storage
+      lock like in the amq-test namespace's master/slave setup. Which pod is
+      "active" is decided entirely by the leader-elector sidecar (see the
+      amq-elector ConfigMap) via a Kubernetes Lease, and enforced by the
+      readinessProbe on the activemq container.
+    -->
+    <beans
+      xmlns="http://www.springframework.org/schema/beans"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+      http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+      <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+        <property name="locations">
+          <value>file:${activemq.conf}/credentials.properties</value>
+        </property>
+      </bean>
+
+      <broker xmlns="http://activemq.apache.org/schema/core"
+              brokerName="amq-broker"
+              persistent="false">
+
+        <managementContext>
+          <managementContext createConnector="false"/>
+        </managementContext>
+
+        <systemUsage>
+          <systemUsage>
+            <memoryUsage>
+              <memoryUsage percentOfJvmHeap="70"/>
+            </memoryUsage>
+            <tempUsage>
+              <tempUsage limit="100 mb"/>
+            </tempUsage>
+          </systemUsage>
+        </systemUsage>
+
+        <transportConnectors>
+          <transportConnector name="openwire" uri="tcp://0.0.0.0:61616?maximumConnections=1000&amp;wireFormat.maxFrameSize=104857600"/>
+        </transportConnectors>
+
+        <shutdownHooks>
+          <bean xmlns="http://www.springframework.org/schema/beans" class="org.apache.activemq.hooks.SpringContextHook"/>
+        </shutdownHooks>
+
+      </broker>
+
+      <import resource="jetty.xml"/>
+
+    </beans>

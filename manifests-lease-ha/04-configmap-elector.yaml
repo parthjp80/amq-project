@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amq-elector
+  namespace: amq-lease-ha
+data:
+  elector.sh: |
+    #!/bin/sh
+    # Leader election against a single Kubernetes Lease object, using the
+    # API server's optimistic-concurrency check (resourceVersion) as the
+    # compare-and-swap primitive, so two pods racing to claim the lease
+    # can't both succeed. Writes true/false to a file on a shared emptyDir;
+    # the activemq container's readinessProbe reads that file, so the
+    # amq-broker Service only ever routes to whichever pod holds the lease.
+    set -eu
+
+    NS="amq-lease-ha"
+    LEASE="amq-active"
+    # A StatefulSet reuses the same pod name (hostname) after a restart, so
+    # identity can't be just hostname - a brand-new process would otherwise
+    # see the lease already says "me" and instantly reclaim it, skipping
+    # the staleness wait entirely and defeating any kill test. Suffix with
+    # a random ID generated fresh per container start so a restarted pod
+    # is treated as a genuinely new contender.
+    IDENTITY="$(hostname)-$(cat /proc/sys/kernel/random/uuid | cut -c1-8)"
+    LEASE_TTL=15
+    POLL_INTERVAL=3
+    STATUS_FILE=/shared/leader
+
+    echo false > "$STATUS_FILE"
+
+    while true; do
+      NOW=$(date -u +%s)
+
+      JSON=$(kubectl -n "$NS" get lease "$LEASE" -o json 2>/dev/null) || JSON=""
+      if [ -z "$JSON" ]; then
+        echo false > "$STATUS_FILE"
+        sleep "$POLL_INTERVAL"
+        continue
+      fi
+
+      RV=$(echo "$JSON" | jq -r '.metadata.resourceVersion')
+      HOLDER=$(echo "$JSON" | jq -r '.spec.holderIdentity // ""')
+      RENEW=$(echo "$JSON" | jq -r '.metadata.annotations["amq.test/renew-epoch"] // "0"')
+
+      CLAIM=false
+      if [ -z "$HOLDER" ]; then
+        CLAIM=true
+      elif [ "$HOLDER" = "$IDENTITY" ]; then
+        CLAIM=true
+      else
+        AGE=$((NOW - RENEW))
+        if [ "$AGE" -gt "$LEASE_TTL" ]; then
+          CLAIM=true
+        fi
+      fi
+
+      if [ "$CLAIM" = "true" ]; then
+        PATCH=$(printf '[{"op":"test","path":"/metadata/resourceVersion","value":"%s"},{"op":"replace","path":"/spec/holderIdentity","value":"%s"},{"op":"replace","path":"/metadata/annotations/amq.test~1renew-epoch","value":"%s"}]' "$RV" "$IDENTITY" "$NOW")
+        if kubectl -n "$NS" patch lease "$LEASE" --type=json -p "$PATCH" >/dev/null 2>&1; then
+          echo true > "$STATUS_FILE"
+        else
+          # Lost the race (someone else's patch landed first) or a real
+          # API error - either way, don't claim to be leader this round.
+          echo false > "$STATUS_FILE"
+        fi
+      else
+        echo false > "$STATUS_FILE"
+      fi
+
+      sleep "$POLL_INTERVAL"
+    done

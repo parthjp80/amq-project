@@ -1,0 +1,19 @@
+# Client-facing Service. Endpoints always = whichever pod currently holds
+# the amq-active Lease, because that's the only pod whose readinessProbe
+# passes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: amq-broker
+  namespace: amq-lease-ha
+spec:
+  type: ClusterIP
+  selector:
+    app: amq
+  ports:
+    - name: openwire
+      port: 61616
+      targetPort: 61616
+    - name: web
+      port: 8161
+      targetPort: 8161
